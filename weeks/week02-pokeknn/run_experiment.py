@@ -2,11 +2,13 @@
 run_experiment.py — Main entry point for the PokéKNN experiment.
 
 Loads Pokémon sprite images, extracts features, runs KNN classification
-for multiple feature methods, evaluates results, and saves visualizations.
+for multiple feature methods and k values, evaluates results, compares
+against baselines, and saves visualizations.
 
 Usage:
     python run_experiment.py
     python run_experiment.py --k 5 --feature combined
+    python run_experiment.py --feature all --k-values 1,3,5,7
     python run_experiment.py --data-dir data/raw --output-dir outputs
 """
 
@@ -20,14 +22,17 @@ script_dir = Path(__file__).resolve().parent
 if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
 
-from src.dataset import load_samples, train_test_split, get_labels
+from src.dataset import load_samples, train_test_split, print_split_distribution, get_labels
 from src.features import extract_features, get_feature_dim
 from src.knn import predict_batch
-from src.evaluate import print_evaluation_summary
+from src.evaluate import (
+    accuracy_score,
+    confusion_matrix,
+    print_evaluation_summary,
+    majority_class_baseline,
+    random_baseline,
+)
 from src.visualize import save_sample_grid, save_confusion_matrix, save_nearest_neighbors
-
-# Import evaluate helpers directly for clarity
-from src.evaluate import accuracy_score, confusion_matrix
 
 
 def check_dataset(data_dir):
@@ -65,9 +70,7 @@ def check_dataset(data_dir):
 
 
 def print_setup_instructions(data_dir):
-    """
-    Print instructions for setting up the dataset when none is found.
-    """
+    """Print instructions for setting up the dataset when none is found."""
     data_path = Path(data_dir)
     print("\n" + "=" * 55)
     print("  Dataset not found or incomplete.")
@@ -87,17 +90,25 @@ def print_setup_instructions(data_dir):
     print("=" * 55)
 
 
+def parse_k_values(k_values_str):
+    """Parse a comma-separated string like '1,3,5,7' into a list of ints."""
+    return [int(k.strip()) for k in k_values_str.split(",")]
+
+
 def run_experiment(args):
-    """
-    Run the full PokéKNN experiment.
-    """
+    """Run the full PokéKNN experiment."""
     data_dir = Path(args.data_dir)
     output_dir = Path(args.output_dir)
-    k = args.k
     image_size = (args.image_size, args.image_size)
     test_size = args.test_size
     seed = args.seed
     feature_choice = args.feature
+
+    # Determine k values to try
+    if args.k_values:
+        k_values = parse_k_values(args.k_values)
+    else:
+        k_values = [args.k]
 
     # Determine which feature methods to run
     if feature_choice == "all":
@@ -105,19 +116,19 @@ def run_experiment(args):
     else:
         feature_methods = [feature_choice]
 
-    print("\n" + "=" * 55)
+    print("\n" + "=" * 60)
     print("  PokéKNN — KNN Pokémon Type Classifier")
-    print("=" * 55)
-    print(f"  Data directory:  {data_dir}")
-    print(f"  Output directory: {output_dir}")
-    print(f"  Image size:       {image_size[0]}x{image_size[1]}")
-    print(f"  k (neighbors):    {k}")
-    print(f"  Test split:       {test_size:.0%}")
-    print(f"  Seed:             {seed}")
-    print(f"  Feature methods:  {', '.join(feature_methods)}")
-    print("=" * 55)
+    print("=" * 60)
+    print(f"  Data directory:   {data_dir}")
+    print(f"  Output directory:  {output_dir}")
+    print(f"  Image size:        {image_size[0]}x{image_size[1]}")
+    print(f"  k values:          {', '.join(str(k) for k in k_values)}")
+    print(f"  Test split:        {test_size:.0%}")
+    print(f"  Seed:              {seed}")
+    print(f"  Feature methods:   {', '.join(feature_methods)}")
+    print("=" * 60)
 
-    # --- Step 1: Load data ---
+    # ── Step 1: Load data ──────────────────────────────────────────────
     print("\n[1/5] Loading dataset...")
     try:
         samples = load_samples(data_dir, image_size=image_size)
@@ -130,82 +141,124 @@ def run_experiment(args):
     labels = get_labels(samples)
     print(f"  Classes: {', '.join(labels)}")
 
-    # --- Step 2: Split into train/test ---
-    print("\n[2/5] Splitting dataset...")
+    # ── Step 2: Stratified split ──────────────────────────────────────
+    print("\n[2/5] Stratified train/test split...")
     train_samples, test_samples = train_test_split(samples, test_size=test_size, seed=seed)
-    print(f"  Train: {len(train_samples)} samples")
-    print(f"  Test:  {len(test_samples)} samples")
+    print_split_distribution(train_samples, test_samples, labels)
 
-    # --- Step 3: Save sample grid ---
+    # ── Step 3: Save sample grid ──────────────────────────────────────
     print("\n[3/5] Saving sample grid...")
-    # Show up to 16 samples from the training set
     grid_samples = train_samples[:min(16, len(train_samples))]
     output_dir.mkdir(parents=True, exist_ok=True)
     save_sample_grid(grid_samples, output_dir / "sample_grid.png")
 
-    # --- Step 4: Run experiments for each feature method ---
-    print("\n[4/5] Running experiments...")
+    # Extract labels for reuse
+    train_labels = [s["label"] for s in train_samples]
+    test_labels = [s["label"] for s in test_samples]
 
+    # ── Step 4: Baselines ─────────────────────────────────────────────
+    print("\n[4/5] Computing baselines...")
+
+    # Majority-class baseline: always predict the most common training label
+    majority_preds, majority_acc = majority_class_baseline(train_labels, len(test_labels))
+    # Evaluate majority baseline on the actual test labels
+    majority_true_acc = accuracy_score(test_labels, majority_preds)
+    print(f"  Majority-class baseline:  {majority_true_acc:.2%} "
+          f"(always predict '{majority_preds[0]}')")
+
+    # Random baseline: randomly pick a label per test sample
+    random_preds, random_expected = random_baseline(labels, len(test_labels), seed=seed)
+    random_true_acc = accuracy_score(test_labels, random_preds)
+    print(f"  Random baseline:         {random_true_acc:.2%} "
+          f"(expected ~{random_expected:.0%} with {len(labels)} classes)")
+
+    # ── Step 5: Run experiments (feature × k) ─────────────────────────
+    print("\n[5/5] Running KNN experiments...")
+
+    # Store results as: results[feature_method][k] = accuracy
     results = {}
 
     for method in feature_methods:
-        print(f"\n  --- Feature method: '{method}' ---")
         feat_dim = get_feature_dim(method, image_size=image_size)
-        print(f"  Feature vector size: {feat_dim}")
+        print(f"\n  --- Feature: '{method}' (dim={feat_dim}) ---")
 
-        # Extract features
+        # Extract features once per method (same features, different k)
         train_features = [extract_features(s["image"], method) for s in train_samples]
         test_features = [extract_features(s["image"], method) for s in test_samples]
 
-        train_features_arr = [f.tolist() if hasattr(f, 'tolist') else f for f in train_features]
-        test_features_arr = [f.tolist() if hasattr(f, 'tolist') else f for f in test_features]
+        results[method] = {}
 
-        train_labels = [s["label"] for s in train_samples]
-        test_labels = [s["label"] for s in test_samples]
+        for k in k_values:
+            # Predict
+            predictions, neighbor_labels, neighbor_dists = predict_batch(
+                train_features, train_labels, test_features, k
+            )
+            acc = accuracy_score(test_labels, predictions)
+            results[method][k] = {
+                "accuracy": acc,
+                "predictions": predictions,
+                "neighbor_labels_list": neighbor_labels,
+                "neighbor_distances_list": neighbor_dists,
+            }
+            print(f"    k={k}: {acc:.2%}")
 
-        # Predict
-        predictions, neighbor_labels_list, neighbor_distances_list = predict_batch(
-            train_features, train_labels, test_features, k
-        )
+    # ── Print compact k-sweep table ───────────────────────────────────
+    if len(k_values) > 1 or len(feature_methods) > 1:
+        print("\n" + "-" * 50)
+        print("  Accuracy summary:")
+        print(f"  {'Feature':<12}", end="")
+        for k in k_values:
+            print(f"  {'k=' + str(k):>8}", end="")
+        print()
+        print("  " + "-" * (12 + len(k_values) * 10))
 
-        # Evaluate
-        acc = accuracy_score(test_labels, predictions)
-        results[method] = {
-            "accuracy": acc,
-            "predictions": predictions,
-            "test_labels": test_labels,
-            "neighbor_labels_list": neighbor_labels_list,
-            "neighbor_distances_list": neighbor_distances_list,
-            "test_samples": test_samples,
-        }
+        for method in feature_methods:
+            print(f"  {method:<12}", end="")
+            for k in k_values:
+                print(f"  {results[method][k]['accuracy']:>7.1%}", end="")
+            print()
+        print("-" * 50)
 
-        print_evaluation_summary(test_labels, predictions, labels, feature_name=method, k=k)
+    # ── Find the single best (feature, k) combination ─────────────────
+    best_feature = None
+    best_k = None
+    best_acc = -1.0
 
-    # --- Step 5: Pick best method and save outputs ---
-    print("\n[5/5] Saving visualizations...")
+    for method in feature_methods:
+        for k in k_values:
+            acc = results[method][k]["accuracy"]
+            if acc > best_acc:
+                best_acc = acc
+                best_feature = method
+                best_k = k
 
-    # Find the best feature method by accuracy
-    best_method = max(results, key=lambda m: results[m]["accuracy"])
-    best_result = results[best_method]
-    print(f"  Best feature method: '{best_method}' "
-          f"(accuracy: {best_result['accuracy']:.2%})")
+    print(f"\n  Best combination: {best_feature}, k={best_k} ({best_acc:.2%})")
 
-    # Save confusion matrix for the best method
-    cm = confusion_matrix(
-        best_result["test_labels"],
+    # ── Print full evaluation for the best combination ────────────────
+    best_result = results[best_feature][best_k]
+    print_evaluation_summary(
+        test_labels,
         best_result["predictions"],
-        labels
+        labels,
+        feature_name=best_feature,
+        k=best_k,
     )
+
+    # ── Save visualizations for the best combination ──────────────────
+    print("  Saving visualizations...")
+
+    # Confusion matrix
+    cm = confusion_matrix(test_labels, best_result["predictions"], labels)
     save_confusion_matrix(cm, labels, output_dir / "confusion_matrix.png")
 
-    # Save nearest neighbors for a test sample (first test sample)
-    if best_result["test_samples"]:
-        query_sample = best_result["test_samples"][0]
+    # Nearest neighbors (use first test sample)
+    if test_samples:
+        query_sample = test_samples[0]
         pred_label = best_result["predictions"][0]
         neighbor_dists = best_result["neighbor_distances_list"][0]
         neighbor_labels = best_result["neighbor_labels_list"][0]
 
-        # Find the corresponding training samples for the neighbors
+        # Find the corresponding training images for the neighbors
         neighbor_samples = []
         for nlabel in neighbor_labels:
             match = None
@@ -216,31 +269,36 @@ def run_experiment(args):
             if match:
                 neighbor_samples.append(match)
             else:
-                # Fallback: use a placeholder (shouldn't happen in practice)
                 neighbor_samples.append(query_sample)
 
         save_nearest_neighbors(
             query_sample,
-            neighbor_samples[:k],  # Only k neighbors
-            neighbor_dists[:k],
+            neighbor_samples[:best_k],
+            neighbor_dists[:best_k],
             pred_label,
             output_dir / "nearest_neighbors.png",
         )
 
-    # --- Final summary ---
-    print("\n" + "=" * 55)
-    print("  Experiment complete!")
-    print("=" * 55)
-    print(f"\n  Results summary:")
-    for method in feature_methods:
-        acc = results[method]["accuracy"]
-        print(f"    {method:<12}  {acc:.2%}")
-    print(f"\n  Best method: {best_method} ({results[best_method]['accuracy']:.2%})")
+    # ── Final summary ─────────────────────────────────────────────────
+    beats_baseline = "yes" if best_acc > majority_true_acc else "no (tie or below)"
+
+    print("\n" + "=" * 60)
+    print("  Final Summary")
+    print("=" * 60)
+    print(f"  Dataset size:              {len(samples)}")
+    print(f"  Classes:                   {', '.join(labels)}")
+    print(f"  Train/test split:          {len(train_samples)}/{len(test_samples)}")
+    print(f"  Majority-class baseline:   {majority_true_acc:.2%}")
+    print(f"  Random baseline:           {random_true_acc:.2%}")
+    print(f"  Best KNN feature method:   {best_feature}")
+    print(f"  Best k:                    {best_k}")
+    print(f"  Best KNN accuracy:         {best_acc:.2%}")
+    print(f"  Beats majority baseline?   {beats_baseline}")
     print(f"\n  Outputs saved to: {output_dir}/")
     print(f"    - sample_grid.png")
     print(f"    - confusion_matrix.png")
     print(f"    - nearest_neighbors.png")
-    print("=" * 55)
+    print("=" * 60 + "\n")
 
 
 def main():
@@ -263,7 +321,13 @@ def main():
         "--k",
         type=int,
         default=3,
-        help="Number of neighbors for KNN (default: 3)",
+        help="Number of neighbors for KNN (default: 3). Ignored if --k-values is set.",
+    )
+    parser.add_argument(
+        "--k-values",
+        type=str,
+        default=None,
+        help="Comma-separated k values to sweep, e.g. '1,3,5,7' (default: use --k)",
     )
     parser.add_argument(
         "--image-size",
